@@ -125,6 +125,43 @@ def quat_to_euler(quat_4: Array, eps: float = 1e-6) -> Array:
     return jnp.concatenate([roll, pitch, yaw], axis=-1)
 
 
+def get_obs(
+    joint_angles: Array,
+    joint_angular_velocities: Array,
+    quaternion: Array,
+    initial_heading: Array,
+    command: Array,
+    gyroscope: Array,
+) -> Array:
+    heading_yaw_cmd = command[2]  # yaw_heading is at index 2
+
+    # Force the body-height parameter to
+
+    initial_heading_quat = euler_to_quat(
+        jnp.array([0.0, 0.0, initial_heading.squeeze()])
+    )
+
+    base_yaw_quat = rotate_quat_inverse(initial_heading_quat, quaternion)
+
+    # Create quaternion from heading command
+    heading_yaw_cmd_quat = euler_to_quat(jnp.array([0.0, 0.0, heading_yaw_cmd]))
+
+    backspun_imu_quat = rotate_quat_inverse(base_yaw_quat, heading_yaw_cmd_quat)
+
+    obs = [
+        joint_angles,  # NUM_JOINTS (20)
+        joint_angular_velocities,  # NUM_JOINTS (20)
+        backspun_imu_quat,  # 4 (backspun IMU quaternion)
+        # quaternion,
+        command,  # 6: [vx, vy, yaw_heading, bh, rx, ry]
+        gyroscope,  # 3 (IMU gyroscope data)
+    ]
+
+    obs_n = jnp.concatenate(obs, axis=-1)
+
+    return obs_n
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("checkpoint_path", type=str)
@@ -139,7 +176,9 @@ def main() -> None:
 
     # Loads the Mujoco model and gets the joint names.
     mujoco_model = task.get_mujoco_model()
-    joint_names = ksim.get_joint_names_in_order(mujoco_model)[1:]  # Removes the root joint.
+    joint_names = ksim.get_joint_names_in_order(mujoco_model)[
+        1:
+    ]  # Removes the root joint.
 
     # Constant values.
     carry_shape = (task.config.depth, task.config.hidden_size)  # (3, 128) hiddens
@@ -154,6 +193,13 @@ def main() -> None:
 
     @jax.jit
     def init_fn() -> Array:
+        """This function gets compiled into an ONNX model that can be loaded by kinfer.
+
+        It is called by the kinfer runtime to initialize the model carry state.
+
+        Returns:
+            Array: an initialized carry with a shape compatible with the model.
+        """
         return jnp.zeros(carry_shape)
 
     @jax.jit
@@ -166,9 +212,50 @@ def main() -> None:
         gyroscope: Array,
         carry: Array,
     ) -> tuple[Array, Array]:
-        heading_yaw_cmd = command[2]  # yaw_heading is at index 2
+        """This function gets compiled into an ONNX model that can be loaded by kinfer.
+        It gets executed each time kinfer wants to execute the ML model.
 
-        initial_heading_quat = euler_to_quat(jnp.array([0.0, 0.0, initial_heading.squeeze()]))
+
+
+        On function parameters:
+        -----------------------
+        kinfer will scan the function input names and match them with an appropriate data source from the ModelProvider.
+        The available data sources are:
+
+        - joint_angles
+        - joint_angular_velocities
+        - initial_heading
+        - quaternion
+        - projected_gravity
+        - accelerometer
+        - gyroscope
+        - command
+        - time
+        - carry
+
+        The names of the input variables must _exactly_ match the name of one of the data sources, or this function cannot be loaded.
+
+        Args:
+            joint_angles (Array): the joint absolute angles, one for each joint
+            joint_angular_velocities (Array): the joint angular velocities, one for each joint
+            quaternion (Array): the quaternion representing the robot's IMU's orientation, expected to be of shape (4,).
+            initial_heading (Array): the initial heading angle of the robot, expected to be of shape (1,).
+            command (Array): the command vector, expected to be of shape (6,) (for this particular model)
+            gyroscope (Array): the raw gyroscope data from the IMU, expected to be of shape (3,).
+            carry (Array): the carry state of the model, which is a hidden state that is passed between steps.
+
+        Returns:
+            tuple[Array, Array]: a tuple containing the model outputs (joint commands) and an updated carry state.
+        """
+        # heading_yaw_cmd = command[2]  # yaw_heading is at index 2
+        # Because the training was done with a backspun IMU, but it was reading
+        # the wrong part of the unified command, we can just pin this value to 0.0
+        # since that's what the ry parameter was set to during training.
+        heading_yaw_cmd = 0.0
+
+        initial_heading_quat = euler_to_quat(
+            jnp.array([0.0, 0.0, initial_heading.squeeze()])
+        )
 
         base_yaw_quat = rotate_quat_inverse(initial_heading_quat, quaternion)
 
@@ -177,15 +264,31 @@ def main() -> None:
 
         backspun_imu_quat = rotate_quat_inverse(base_yaw_quat, heading_yaw_cmd_quat)
 
+        # command = command.at[0].set(
+        #     0.0
+        # )  # Force backwards motion to see if the model is interpreting anything
+
+        # The yaw-command thing doesn't work
+        # command = command.at[2].set(0.0)
+
         obs = [
             joint_angles,  # NUM_JOINTS (20)
             joint_angular_velocities,  # NUM_JOINTS (20)
-            backspun_imu_quat,  # 4 (backspun IMU quaternion)
+            # backspun_imu_quat,  # 4 (backspun IMU quaternion)
+            # jnp.array([1.0, 0.0, 0.0, 0.0]),  # Force the IMU quaternion to be identity
+            quaternion,
             command,  # 6: [vx, vy, yaw_heading, bh, rx, ry]
+            # jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),  # Tell the model to walk forward
             gyroscope,  # 3 (IMU gyroscope data)
         ]
 
         obs_n = jnp.concatenate(obs, axis=-1)
+
+        # Try providing absolutely no input to the model and see what it does
+        # obs_n = jnp.array([0.0 for _ in range(53)])
+
+        assert len(obs_n) == 53
+
         dist, carry = model.actor.forward(obs_n, carry)
         return dist.mode(), carry
 
