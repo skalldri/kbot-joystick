@@ -10,6 +10,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .dmypy.json
+*.kinfer
 
 # Jupyter
 .ipynb_checkpoints/
