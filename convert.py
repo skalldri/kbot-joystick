@@ -12,6 +12,7 @@ from kinfer.export.serialize import pack
 from kinfer.rust_bindings import PyModelMetadata
 
 from train import HumanoidWalkingTask, Model
+from step import step_fn as model_step_fn
 
 NUM_COMMANDS_MODEL = 6
 
@@ -206,16 +207,13 @@ def main() -> None:
     def step_fn(
         joint_angles: Array,
         joint_angular_velocities: Array,
-        quaternion: Array,
-        initial_heading: Array,
-        command: Array,
         gyroscope: Array,
+        accelerometer: Array,
+        command: Array,
         carry: Array,
     ) -> tuple[Array, Array]:
         """This function gets compiled into an ONNX model that can be loaded by kinfer.
         It gets executed each time kinfer wants to execute the ML model.
-
-
 
         On function parameters:
         -----------------------
@@ -225,7 +223,6 @@ def main() -> None:
         - joint_angles
         - joint_angular_velocities
         - initial_heading
-        - quaternion
         - projected_gravity
         - accelerometer
         - gyroscope
@@ -238,58 +235,29 @@ def main() -> None:
         Args:
             joint_angles (Array): the joint absolute angles, one for each joint
             joint_angular_velocities (Array): the joint angular velocities, one for each joint
-            quaternion (Array): the quaternion representing the robot's IMU's orientation, expected to be of shape (4,).
             initial_heading (Array): the initial heading angle of the robot, expected to be of shape (1,).
             command (Array): the command vector, expected to be of shape (6,) (for this particular model)
             gyroscope (Array): the raw gyroscope data from the IMU, expected to be of shape (3,).
+            accelerometer (Array): the raw accelerometer data from the IMU, expected to be of shape (3,).
             carry (Array): the carry state of the model, which is a hidden state that is passed between steps.
 
         Returns:
             tuple[Array, Array]: a tuple containing the model outputs (joint commands) and an updated carry state.
         """
-        # heading_yaw_cmd = command[2]  # yaw_heading is at index 2
-        # Because the training was done with a backspun IMU, but it was reading
-        # the wrong part of the unified command, we can just pin this value to 0.0
-        # since that's what the ry parameter was set to during training.
-        heading_yaw_cmd = 0.0
 
-        initial_heading_quat = euler_to_quat(
-            jnp.array([0.0, 0.0, initial_heading.squeeze()])
+        dist, carry = model_step_fn(
+            actor=model.actor,
+            joint_angles=joint_angles,
+            joint_angular_velocities=joint_angular_velocities,
+            gyroscope=gyroscope,
+            accelerometer=accelerometer,
+            command=command,
+            carry=carry,
         )
 
-        base_yaw_quat = rotate_quat_inverse(initial_heading_quat, quaternion)
-
-        # Create quaternion from heading command
-        heading_yaw_cmd_quat = euler_to_quat(jnp.array([0.0, 0.0, heading_yaw_cmd]))
-
-        backspun_imu_quat = rotate_quat_inverse(base_yaw_quat, heading_yaw_cmd_quat)
-
-        # command = command.at[0].set(
-        #     0.0
-        # )  # Force backwards motion to see if the model is interpreting anything
-
-        # The yaw-command thing doesn't work
-        # command = command.at[2].set(0.0)
-
-        obs = [
-            joint_angles,  # NUM_JOINTS (20)
-            joint_angular_velocities,  # NUM_JOINTS (20)
-            # backspun_imu_quat,  # 4 (backspun IMU quaternion)
-            # jnp.array([1.0, 0.0, 0.0, 0.0]),  # Force the IMU quaternion to be identity
-            quaternion,
-            command,  # 6: [vx, vy, yaw_heading, bh, rx, ry]
-            # jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),  # Tell the model to walk forward
-            gyroscope,  # 3 (IMU gyroscope data)
-        ]
-
-        obs_n = jnp.concatenate(obs, axis=-1)
-
-        # Try providing absolutely no input to the model and see what it does
-        # obs_n = jnp.array([0.0 for _ in range(53)])
-
-        assert len(obs_n) == 53
-
-        dist, carry = model.actor.forward(obs_n, carry)
+        # The step function outputs the probability distribution in the action space. This is used during training.
+        # At inference time, we want to get the most likely action.
+        # Here we return the mode of the distribution as the action to take.
         return dist.mode(), carry
 
     init_onnx = export_fn(
